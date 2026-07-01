@@ -57,6 +57,19 @@ body.prozen-zen .mobile-navbar {
 	display: none !important;
 }
 
+/* Suppress pop-up UI while in pseudo-fullscreen Zen mode: the [[ link /
+   tag / slash-command autocomplete dropdowns, hover popovers, and
+   tooltips. Desktop's native fullscreen hides these implicitly because
+   they are rendered outside the fullscreened element; this replicates
+   that. Modals (e.g. the command palette needed to exit Zen mode) are
+   intentionally left visible. */
+body.prozen-zen .suggestion-container,
+body.prozen-zen .popover,
+body.prozen-zen .hover-popover,
+body.prozen-zen .tooltip {
+	display: none !important;
+}
+
 @keyframes fadeIn {
 	0% {
 		opacity: 0;
