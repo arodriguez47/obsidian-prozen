@@ -63,6 +63,12 @@ body.prozen-zen .mobile-navbar {
    they are rendered outside the fullscreened element; this replicates
    that. Modals (e.g. the command palette needed to exit Zen mode) are
    intentionally left visible. */
+/* Hide the editing toolbar above the keyboard in Zen mode, unless the
+   "Show editing toolbar" setting is on. */
+body.prozen-zen.prozen-hide-toolbar .mobile-toolbar {
+	display: none !important;
+}
+
 body.prozen-zen .suggestion-container,
 body.prozen-zen .popover,
 body.prozen-zen .hover-popover,

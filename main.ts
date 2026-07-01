@@ -5,6 +5,7 @@ interface PluginSettings {
 	showHeader: boolean,
 	showScroll: boolean,
 	showGraphControls: boolean,
+	showMobileToolbar: boolean,
 	forceReadable: boolean,
 	vignetteOpacity: number,
 	vignetteScaleLinear: number,
@@ -16,6 +17,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	showHeader: false,
 	showScroll: false,
 	showGraphControls: false,
+	showMobileToolbar: false,
 	forceReadable: true, 
 	vignetteOpacity: 0.75,
 	vignetteScaleLinear: 20,
@@ -93,6 +95,7 @@ export default class Prozen extends Plugin {
 		const containerEl = (leaf as any).containerEl as HTMLElement;
 		containerEl.classList.add("prozen-fullscreen");
 		document.body.classList.add("prozen-zen");
+		if (!this.settings.showMobileToolbar) { document.body.classList.add("prozen-hide-toolbar") }
 		this.addStyles(leaf);
 	}
 
@@ -102,7 +105,7 @@ export default class Prozen extends Plugin {
 		this.zenLeaf = null;
 		const containerEl = (leaf as any).containerEl as HTMLElement;
 		containerEl.classList.remove("prozen-fullscreen");
-		document.body.classList.remove("prozen-zen");
+		document.body.classList.remove("prozen-zen", "prozen-hide-toolbar");
 		this.removeStyles(leaf);
 	}
 
@@ -270,6 +273,21 @@ class ProzenSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 			})
 		);
+// SHOW MOBILE TOOLBAR TOGGLE SETTING
+		if (Platform.isMobileApp) {
+			new Setting(containerEl)
+				.setName("Show editing toolbar")
+				.setDesc("Show the toolbar above the keyboard while editing in Zen mode")
+				.addToggle((toggle) =>	toggle
+					.setValue(this.plugin.settings.showMobileToolbar)
+					.onChange(async (value) => {
+						this.plugin.settings.showMobileToolbar = value;
+						document.body.classList.toggle("prozen-hide-toolbar",
+							document.body.classList.contains("prozen-zen") && !value);
+						await this.plugin.saveSettings();
+				})
+			);
+		}
 
 		this.containerEl.createEl("h3", {
 			text: "Misc",
