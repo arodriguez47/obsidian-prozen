@@ -6,6 +6,8 @@ The true 'Zen' (fullscreen) mode for Obsidian.
 
 ProZen not just simply turns your active tab fullscreen - it removes every single distraction. All panels, icons, even scrollbar is gone in Zen mode. And for those who like **extra** concentration on writing or reading, ProZen can dim the sides of the screen, like a vignette.
 
+This fork also works on Obsidian **mobile** (iOS and Android). Since the mobile webview has no Fullscreen API, Zen mode there expands the active tab over the whole app window and hides the navigation bar instead. To exit, run the Zen mode command again (pull down to open the command palette).
+
 ![prozen](https://user-images.githubusercontent.com/69085343/203395343-b1b35200-662d-48f3-b400-3a99fccce915.gif)
 *The gradient is much smoother than on the gif*.
 
