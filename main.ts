@@ -1,10 +1,11 @@
-import { App, ItemView, Plugin, PluginSettingTab, Setting, WorkspaceLeaf } from "obsidian";
+import { App, ItemView, Platform, Plugin, PluginSettingTab, Setting, WorkspaceLeaf } from "obsidian";
 
 interface PluginSettings {
 	animationDuration: number,
 	showHeader: boolean,
 	showScroll: boolean,
 	showGraphControls: boolean,
+	showMobileToolbar: boolean,
 	forceReadable: boolean,
 	vignetteOpacity: number,
 	vignetteScaleLinear: number,
@@ -16,6 +17,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	showHeader: false,
 	showScroll: false,
 	showGraphControls: false,
+	showMobileToolbar: false,
 	forceReadable: true, 
 	vignetteOpacity: 0.75,
 	vignetteScaleLinear: 20,
@@ -24,6 +26,9 @@ const DEFAULT_SETTINGS: PluginSettings = {
 
 export default class Prozen extends Plugin {
 	settings: PluginSettings;
+	// Leaf currently in CSS-based (pseudo-fullscreen) Zen mode. Used on
+	// platforms without the Fullscreen API, i.e. Obsidian mobile.
+	zenLeaf: WorkspaceLeaf | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -35,7 +40,9 @@ export default class Prozen extends Plugin {
 		this.addSettingTab(new ProzenSettingTab(this.app, this));
 	}
 
-	onunload() {}
+	onunload() {
+		this.exitZen();
+	}
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -47,18 +54,27 @@ export default class Prozen extends Plugin {
 
 	fullscreenMode() {
 		// Use ItemView for multiple view types (previously it was only MarkdownView)
-		const leaf = this.app.workspace.getActiveViewOfType(ItemView).leaf;
-		if (!leaf) return;
+		const view = this.app.workspace.getActiveViewOfType(ItemView);
+		if (!view) return;
+		const leaf = view.leaf;
 		// Don't trigger fullscreen mode when current leaf is empty.
 		if(leaf.view.getViewType() === "empty") return;
 
 		const root = document.documentElement
 		root.style.setProperty('--fadeIn-duration', this.settings.animationDuration + 's')
-		root.style.setProperty('--vignette-opacity', this.settings.vignetteOpacity)
+		root.style.setProperty('--vignette-opacity', String(this.settings.vignetteOpacity))
 		root.style.setProperty('--vignette-scale-linear', this.settings.vignetteScaleLinear + '%')
 		root.style.setProperty('--vignette-scale-radial', this.settings.vignetteScaleRadial + '%')
-		
-		const containerEl = leaf.containerEl;
+
+		const containerEl = (leaf as any).containerEl as HTMLElement;
+
+		// The Fullscreen API isn't available in Obsidian mobile's webview
+		// (iOS has no element fullscreen at all), so fall back to a
+		// CSS-based pseudo-fullscreen there.
+		if (Platform.isMobileApp || typeof containerEl.requestFullscreen !== "function") {
+			this.zenLeaf ? this.exitZen() : this.enterZen(leaf);
+			return;
+		}
 
 		if (!document.fullscreenElement){
 			containerEl.requestFullscreen();
@@ -74,35 +90,54 @@ export default class Prozen extends Plugin {
 		}
 	}
 
+	enterZen(leaf: WorkspaceLeaf) {
+		this.zenLeaf = leaf;
+		const containerEl = (leaf as any).containerEl as HTMLElement;
+		containerEl.classList.add("prozen-fullscreen");
+		document.body.classList.add("prozen-zen");
+		if (!this.settings.showMobileToolbar) { document.body.classList.add("prozen-hide-toolbar") }
+		this.addStyles(leaf);
+	}
+
+	exitZen() {
+		if (!this.zenLeaf) return;
+		const leaf = this.zenLeaf;
+		this.zenLeaf = null;
+		const containerEl = (leaf as any).containerEl as HTMLElement;
+		containerEl.classList.remove("prozen-fullscreen");
+		document.body.classList.remove("prozen-zen", "prozen-hide-toolbar");
+		this.removeStyles(leaf);
+	}
+
 	addStyles(leaf: WorkspaceLeaf) {
-		const viewEl = leaf.view.contentEl
-		const header = leaf.view.headerEl
+		const view = leaf.view as any;
+		const viewEl: HTMLElement = view.contentEl
+		const header: HTMLElement = view.headerEl
 		const isGraph = leaf.view.getViewType() === "graph"
 
-		let graphControls: HTMLElement;
-		if (isGraph) { graphControls = leaf.view.dataEngine.controlsEl}
 		if (!this.settings.showScroll){	viewEl.classList.add("noscroll") }
-		if (isGraph && !this.settings.showGraphControls) { graphControls.classList.add("hide") }
+		if (isGraph && !this.settings.showGraphControls) { view.dataEngine.controlsEl.classList.add("hide") }
 		isGraph ? viewEl.classList.add("vignette-radial") : viewEl.classList.add("vignette-linear")
-		if (!isGraph && this.settings.forceReadable) { leaf.view.editMode.editorEl.classList.add("is-readable-line-width") }
+		// editMode is only present on markdown views in editing mode (e.g.
+		// not in reading mode on mobile), hence the optional chaining.
+		if (!isGraph && this.settings.forceReadable) { view.editMode?.editorEl?.classList.add("is-readable-line-width") }
 
-		
+
 		viewEl.classList.add("animate")
 		this.settings.showHeader ? header.classList.add("animate") : header.classList.add("hide")
 
 	}
 
 	removeStyles(leaf: WorkspaceLeaf) {
-		const viewEl = leaf.view.contentEl
-		const header = leaf.view.headerEl
+		const view = leaf.view as any;
+		const viewEl: HTMLElement = view.contentEl
+		const header: HTMLElement = view.headerEl
 		const isGraph = leaf.view.getViewType() === "graph"
 
-		let graphControls: HTMLElement;
 		if (isGraph) {
-			graphControls = leaf.view.dataEngine.controlsEl
-			graphControls.classList.remove("animate", "hide")
-		} else if (!this.app.vault.getConfig('readableLineLength')) {
-			leaf.view.editMode.editorEl.classList.remove("is-readable-line-width")
+			view.dataEngine.controlsEl.classList.remove("animate", "hide")
+		} else if (!(this.app.vault as any).getConfig('readableLineLength')) {
+			view.editMode?.editorEl?.classList.remove("is-readable-line-width")
 		}
 
 		viewEl.classList.remove("vignette-linear", "vignette-radial", "animate", "noscroll")
@@ -238,6 +273,21 @@ class ProzenSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 			})
 		);
+// SHOW MOBILE TOOLBAR TOGGLE SETTING
+		if (Platform.isMobileApp) {
+			new Setting(containerEl)
+				.setName("Show editing toolbar")
+				.setDesc("Show the toolbar above the keyboard while editing in Zen mode")
+				.addToggle((toggle) =>	toggle
+					.setValue(this.plugin.settings.showMobileToolbar)
+					.onChange(async (value) => {
+						this.plugin.settings.showMobileToolbar = value;
+						document.body.classList.toggle("prozen-hide-toolbar",
+							document.body.classList.contains("prozen-zen") && !value);
+						await this.plugin.saveSettings();
+				})
+			);
+		}
 
 		this.containerEl.createEl("h3", {
 			text: "Misc",
