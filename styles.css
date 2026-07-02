@@ -1,15 +1,43 @@
 :root {
 	--vignette-opacity: 1;
-	--fadeIn-duration: "2s";
+	--fadeIn-duration: 2s;
 	--vignette-scale-linear: 20%;
-	--vignette-scale-radial: 50%;
+	--vignette-scale-radial: 75%;
 }
 
-.noscroll ::-webkit-scrollbar-thumb{
-	visibility: hidden;
+/* ===================================================================
+   Zen engine: all state lives on document.body (.prozen-zen plus
+   settings-derived classes) and one marker class (.prozen-active-leaf)
+   that the plugin keeps on the active root-split leaf. Every visual
+   rule below is declarative — switching tabs moves the marker and the
+   browser re-applies everything; no per-leaf JS styling exists.
+   =================================================================== */
+
+/* The active leaf stretches over the whole app window (pseudo-fullscreen).
+   Everything else in the window sits beneath it. z-index at the modal
+   layer keeps modals/palette (same layer, later in DOM), suggestions (60),
+   notices (60), and menus (65) above the Zen surface.
+   `contain: none` and `!important` override the app's
+   `.workspace-leaf { contain: strict !important }` and the stacked-tabs
+   sticky rule — plugin CSS loads after app.css, so source order wins at
+   equal specificity. */
+body.prozen-zen .workspace-split.mod-root .workspace-leaf.prozen-active-leaf {
+	position: fixed !important;
+	top: 0 !important;
+	right: 0 !important;
+	bottom: 0 !important;
+	left: 0 !important;
+	width: auto !important;
+	height: auto !important;
+	z-index: var(--layer-modal, 50) !important;
+	contain: none !important;
+	background-color: var(--background-primary);
+	padding-top: env(safe-area-inset-top, 0px);
+	padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
-.vignette-linear {
+/* Vignette: linear for text views, radial for the graph view. */
+body.prozen-zen .workspace-leaf.prozen-active-leaf .workspace-leaf-content:not([data-type="graph"]) .view-content {
 	background: linear-gradient(
 		90deg,
 		rgba(0, 0, 0, var(--vignette-opacity)) 0%,
@@ -19,7 +47,7 @@
 	);
 }
 
-.vignette-radial {
+body.prozen-zen .workspace-leaf.prozen-active-leaf .workspace-leaf-content[data-type="graph"] .view-content {
 	background: radial-gradient(
 		circle,
 		rgba(0, 0, 0, 0) calc(100% - var(--vignette-scale-radial)),
@@ -27,28 +55,36 @@
 	);
 }
 
-.animate {
-	animation: fadeIn var(--fadeIn-duration);
+/* Entry animation: gated by the transient body class the plugin adds on
+   session entry only — tab switches and session restore never replay it. */
+body.prozen-zen.prozen-entering .workspace-leaf.prozen-active-leaf .view-content {
+	animation: prozen-fadeIn var(--fadeIn-duration);
 }
 
-.hide {
+/* Element toggles (settings-derived body classes). */
+body.prozen-zen:not(.prozen-show-header) .workspace-leaf.prozen-active-leaf .view-header {
 	display: none !important;
 }
 
-/* Pseudo-fullscreen Zen mode for platforms without the Fullscreen API
-   (Obsidian mobile). The active leaf is stretched over the whole app
-   window and everything else is covered. */
-.prozen-fullscreen {
-	position: fixed !important;
-	top: 0 !important;
-	right: 0 !important;
-	bottom: 0 !important;
-	left: 0 !important;
-	z-index: var(--layer-modal, 50) !important;
-	background-color: var(--background-primary);
-	padding-top: env(safe-area-inset-top);
-	padding-bottom: env(safe-area-inset-bottom);
+body.prozen-zen:not(.prozen-show-scroll) .workspace-leaf.prozen-active-leaf ::-webkit-scrollbar-thumb {
+	visibility: hidden;
 }
+
+body.prozen-zen:not(.prozen-show-graph-controls) .workspace-leaf.prozen-active-leaf .graph-controls {
+	display: none !important;
+}
+
+/* "Force content centering": ProZen-owned readable width, independent of
+   the vault-wide Readable Line Length setting. Applies in editing and
+   reading mode alike (the old editMode-only class missed reading mode). */
+body.prozen-zen.prozen-readable .workspace-leaf.prozen-active-leaf .cm-sizer,
+body.prozen-zen.prozen-readable .workspace-leaf.prozen-active-leaf .markdown-preview-sizer {
+	max-width: var(--file-line-width, 700px);
+	margin-left: auto !important;
+	margin-right: auto !important;
+}
+
+/* ---------- Mobile chrome ---------- */
 
 /* Hide the mobile navigation bar while in Zen mode. The command palette
    stays reachable via the pull-down gesture, so Zen mode can be exited
@@ -57,18 +93,17 @@ body.prozen-zen .mobile-navbar {
 	display: none !important;
 }
 
-/* Suppress pop-up UI while in pseudo-fullscreen Zen mode: the [[ link /
-   tag / slash-command autocomplete dropdowns, hover popovers, and
-   tooltips. Desktop's native fullscreen hides these implicitly because
-   they are rendered outside the fullscreened element; this replicates
-   that. Modals (e.g. the command palette needed to exit Zen mode) are
-   intentionally left visible. */
 /* Hide the editing toolbar above the keyboard in Zen mode, unless the
    "Show editing toolbar" setting is on. */
 body.prozen-zen.prozen-hide-toolbar .mobile-toolbar {
 	display: none !important;
 }
 
+/* Suppress pop-up UI while in Zen mode: the [[ link / tag / slash-command
+   autocomplete dropdowns, hover popovers, and tooltips. This now applies on
+   desktop too, matching the old native-fullscreen behavior where popups were
+   invisible for structural reasons. Modals (e.g. the command palette needed
+   to exit Zen mode) are intentionally left visible. */
 body.prozen-zen .suggestion-container,
 body.prozen-zen .popover,
 body.prozen-zen .hover-popover,
@@ -76,7 +111,7 @@ body.prozen-zen .tooltip {
 	display: none !important;
 }
 
-@keyframes fadeIn {
+@keyframes prozen-fadeIn {
 	0% {
 		opacity: 0;
 		transform: scale(1.05);

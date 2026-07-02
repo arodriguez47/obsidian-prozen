@@ -1,4 +1,13 @@
 import { App, ItemView, Platform, Plugin, PluginSettingTab, Setting, WorkspaceLeaf } from "obsidian";
+import {
+	decideMarker,
+	decideToggle,
+	isPersistedSessionActive,
+	shouldEngageWrapper,
+	shouldExitOnEsc,
+	shouldExitOsFullscreen,
+	LeafContext,
+} from "./src/session";
 
 interface PluginSettings {
 	animationDuration: number,
@@ -7,6 +16,7 @@ interface PluginSettings {
 	showGraphControls: boolean,
 	showMobileToolbar: boolean,
 	forceReadable: boolean,
+	fullscreenWindow: boolean,
 	vignetteOpacity: number,
 	vignetteScaleLinear: number,
 	vignetteScaleRadial: number
@@ -18,30 +28,84 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	showScroll: false,
 	showGraphControls: false,
 	showMobileToolbar: false,
-	forceReadable: true, 
+	forceReadable: true,
+	fullscreenWindow: true,
 	vignetteOpacity: 0.75,
 	vignetteScaleLinear: 20,
 	vignetteScaleRadial: 75
 }
 
+const SESSION_STORAGE_KEY = "prozen-session";
+const MARKER_CLASS = "prozen-active-leaf";
+const BODY_CLASSES = [
+	"prozen-zen",
+	"prozen-entering",
+	"prozen-show-header",
+	"prozen-show-scroll",
+	"prozen-show-graph-controls",
+	"prozen-readable",
+	"prozen-hide-toolbar",
+];
+
+// containerEl is not part of the public WorkspaceLeaf typings, but every
+// shipped zen plugin relies on it; a narrow cast keeps the surface explicit.
+interface LeafWithContainer {
+	containerEl?: HTMLElement;
+}
+
+// window.electronWindow is a global Obsidian defines on every desktop window
+// (an @electron/remote BrowserWindow handle). Undocumented — every access is
+// optional-chained, with the HTML Fullscreen API as fallback.
+interface ElectronWindowLike {
+	isFullScreen?: () => boolean;
+	setFullScreen?: (flag: boolean) => void;
+	on?: (event: string, listener: () => void) => void;
+	removeListener?: (event: string, listener: () => void) => void;
+}
+
+// vault.getConfig is private API; used only to honor the vim-mode Esc carve-out.
+interface VaultWithConfig {
+	getConfig?: (key: string) => unknown;
+}
+
 export default class Prozen extends Plugin {
 	settings: PluginSettings;
-	// Leaf currently in CSS-based (pseudo-fullscreen) Zen mode. Used on
-	// platforms without the Fullscreen API, i.e. Obsidian mobile.
-	zenLeaf: WorkspaceLeaf | null = null;
+	private sessionActive = false;
+	// The wrapper put (or found) the window in OS fullscreen for this session.
+	private wrapperEngaged = false;
+	private prevWasFullscreen = false;
+	private wrapperMode: "electron" | "domfs" | null = null;
+	// Plugin-initiated setFullScreen calls suppress the external-exit listener
+	// until this timestamp (Electron emits fullscreen events asynchronously).
+	private suppressFullscreenEventsUntil = 0;
+	private enteringTimer: number | null = null;
+	private leaveFullScreenListener: (() => void) | null = null;
 
 	async onload() {
 		await this.loadSettings();
 		this.addCommand({
 			id: "zenmode",
 			name: "Zen mode",
-			callback: this.fullscreenMode.bind(this),
+			callback: this.toggleZen.bind(this),
 		});
 		this.addSettingTab(new ProzenSettingTab(this.app, this));
+
+		// Register events inside onLayoutReady to skip the leaf-change storm
+		// during workspace construction, then restore any persisted session.
+		this.app.workspace.onLayoutReady(() => {
+			this.registerEvent(
+				this.app.workspace.on("active-leaf-change", (leaf) => this.onActiveLeafChange(leaf))
+			);
+			this.registerDomEvent(document, "keydown", (evt) => this.onKeydown(evt));
+			this.registerDomEvent(document, "fullscreenchange", () => this.onDomFullscreenChange());
+			this.restoreSession();
+		});
 	}
 
 	onunload() {
-		this.exitZen();
+		// Tear down visuals and the wrapper, but keep the persisted flag:
+		// a plugin update (unload -> load) restores the session.
+		this.teardownVisuals();
 	}
 
 	async loadSettings() {
@@ -52,96 +116,273 @@ export default class Prozen extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	fullscreenMode() {
-		// Use ItemView for multiple view types (previously it was only MarkdownView)
-		const view = this.app.workspace.getActiveViewOfType(ItemView);
-		if (!view) return;
-		const leaf = view.leaf;
-		// Don't trigger fullscreen mode when current leaf is empty.
-		if(leaf.view.getViewType() === "empty") return;
+	isZenActive(): boolean {
+		return this.sessionActive;
+	}
 
-		const root = document.documentElement
-		root.style.setProperty('--fadeIn-duration', this.settings.animationDuration + 's')
-		root.style.setProperty('--vignette-opacity', String(this.settings.vignetteOpacity))
-		root.style.setProperty('--vignette-scale-linear', this.settings.vignetteScaleLinear + '%')
-		root.style.setProperty('--vignette-scale-radial', this.settings.vignetteScaleRadial + '%')
+	toggleZen() {
+		const action = decideToggle(this.sessionActive, this.activeLeafContext());
+		if (action === "exit") {
+			this.exitZen();
+		} else if (action === "enter") {
+			this.enterZen({ animate: true, wrapper: true });
+		}
+	}
 
-		const containerEl = (leaf as any).containerEl as HTMLElement;
+	private enterZen(opts: { animate: boolean; wrapper: boolean }) {
+		this.sessionActive = true;
+		this.applyCssVariables();
+		this.applyBodyClasses();
+		if (opts.animate) this.startEnteringAnimation();
+		this.updateMarker(this.activeLeaf());
+		this.persistSession(true);
+		if (opts.wrapper) this.engageWrapper();
+	}
 
-		// The Fullscreen API isn't available in Obsidian mobile's webview
-		// (iOS has no element fullscreen at all), so fall back to a
-		// CSS-based pseudo-fullscreen there.
-		if (Platform.isMobileApp || typeof containerEl.requestFullscreen !== "function") {
-			this.zenLeaf ? this.exitZen() : this.enterZen(leaf);
+	private exitZen() {
+		this.teardownVisuals();
+		this.persistSession(false);
+	}
+
+	// Shared by exitZen and onunload: removes every visual/system effect the
+	// session created. Tolerates partially-applied state.
+	private teardownVisuals() {
+		this.sessionActive = false;
+		this.clearEnteringTimer();
+		document.body.classList.remove(...BODY_CLASSES);
+		this.clearAllMarkers();
+		this.releaseWrapper();
+	}
+
+	// ---------- Session restore (R6/R7) ----------
+
+	private restoreSession() {
+		try {
+			if (!isPersistedSessionActive(this.app.loadLocalStorage(SESSION_STORAGE_KEY))) return;
+			// CSS engine only: no OS fullscreen (needs a user gesture and would
+			// be hostile at launch), no entry animation (no flash on startup).
+			this.enterZen({ animate: false, wrapper: false });
+		} catch (error) {
+			// A broken restore (e.g. selector drift after an Obsidian update)
+			// must degrade to "Zen off" once, not recur on every launch.
+			this.persistSession(false);
+			this.teardownVisuals();
+			console.error("ProZen: failed to restore Zen session; cleared the persisted flag.", error);
+		}
+	}
+
+	private persistSession(active: boolean) {
+		// Per-device on purpose: data.json can sync across devices, and a Zen
+		// session on the iPad must not fullscreen the desktop at next launch.
+		this.app.saveLocalStorage(SESSION_STORAGE_KEY, active ? true : null);
+	}
+
+	// ---------- Active-leaf tracking (R4/R5) ----------
+
+	private onActiveLeafChange(leaf: WorkspaceLeaf | null) {
+		const action = decideMarker(this.sessionActive, this.leafContext(leaf));
+		if (action === "clear") {
+			this.clearAllMarkers();
+		} else if (action === "move") {
+			this.updateMarker(leaf);
+		}
+	}
+
+	private updateMarker(leaf: WorkspaceLeaf | null) {
+		// Clearing every occurrence first makes duplicate markers structurally
+		// impossible, even across leaf drags and layout rebuilds.
+		this.clearAllMarkers();
+		if (!leaf) return;
+		if (decideMarker(this.sessionActive, this.leafContext(leaf)) !== "move") return;
+		const containerEl = (leaf as unknown as LeafWithContainer).containerEl;
+		containerEl?.classList.add(MARKER_CLASS);
+	}
+
+	private clearAllMarkers() {
+		document.querySelectorAll("." + MARKER_CLASS).forEach((el) => el.classList.remove(MARKER_CLASS));
+	}
+
+	private activeLeaf(): WorkspaceLeaf | null {
+		return this.app.workspace.getActiveViewOfType(ItemView)?.leaf ?? null;
+	}
+
+	private activeLeafContext(): LeafContext | null {
+		return this.leafContext(this.activeLeaf());
+	}
+
+	private leafContext(leaf: WorkspaceLeaf | null): LeafContext | null {
+		if (!leaf) return null;
+		const viewType = leaf.view?.getViewType() ?? "empty";
+		const containerEl = (leaf as unknown as LeafWithContainer).containerEl ?? null;
+		let inRootSplit = false;
+		try {
+			inRootSplit = leaf.getRoot() === this.app.workspace.rootSplit;
+		} catch {
+			inRootSplit = false;
+		}
+		return {
+			viewKind: viewType === "empty" ? "empty" : viewType === "graph" ? "graph" : "other",
+			inRootSplit,
+			inMainWindow: containerEl ? containerEl.ownerDocument === document : false,
+		};
+	}
+
+	// ---------- Presentation (R1/R8) ----------
+
+	private applyCssVariables() {
+		const root = document.documentElement;
+		root.style.setProperty("--fadeIn-duration", this.settings.animationDuration + "s");
+		root.style.setProperty("--vignette-opacity", String(this.settings.vignetteOpacity));
+		root.style.setProperty("--vignette-scale-linear", this.settings.vignetteScaleLinear + "%");
+		root.style.setProperty("--vignette-scale-radial", this.settings.vignetteScaleRadial + "%");
+	}
+
+	private applyBodyClasses() {
+		const body = document.body;
+		body.classList.add("prozen-zen");
+		body.classList.toggle("prozen-show-header", this.settings.showHeader);
+		body.classList.toggle("prozen-show-scroll", this.settings.showScroll);
+		body.classList.toggle("prozen-show-graph-controls", this.settings.showGraphControls);
+		body.classList.toggle("prozen-readable", this.settings.forceReadable);
+		body.classList.toggle("prozen-hide-toolbar", !this.settings.showMobileToolbar);
+	}
+
+	// Settings changes take effect immediately during an active session.
+	refreshZenAppearance() {
+		if (!this.sessionActive) return;
+		this.applyCssVariables();
+		this.applyBodyClasses();
+	}
+
+	private startEnteringAnimation() {
+		this.clearEnteringTimer();
+		document.body.classList.add("prozen-entering");
+		const durationMs = Math.max(0, (Number(this.settings.animationDuration) || 0) * 1000);
+		this.enteringTimer = window.setTimeout(() => {
+			document.body.classList.remove("prozen-entering");
+			this.enteringTimer = null;
+		}, durationMs);
+	}
+
+	private clearEnteringTimer() {
+		if (this.enteringTimer !== null) {
+			window.clearTimeout(this.enteringTimer);
+			this.enteringTimer = null;
+		}
+		document.body.classList.remove("prozen-entering");
+	}
+
+	// ---------- OS-fullscreen wrapper (R2/R3) ----------
+
+	private electronWindow(): ElectronWindowLike | null {
+		if (!Platform.isDesktopApp) return null;
+		return (window as unknown as { electronWindow?: ElectronWindowLike }).electronWindow ?? null;
+	}
+
+	private engageWrapper() {
+		if (!shouldEngageWrapper(Platform.isDesktopApp, this.settings.fullscreenWindow)) return;
+		if (this.wrapperEngaged) return;
+		const win = this.electronWindow();
+		if (win?.setFullScreen && win.isFullScreen) {
+			this.prevWasFullscreen = win.isFullScreen();
+			this.attachLeaveFullScreenListener(win);
+			if (!this.prevWasFullscreen) {
+				this.suppressFullscreenEventsUntil = Date.now() + 2000;
+				win.setFullScreen(true);
+			}
+			this.wrapperMode = "electron";
+			this.wrapperEngaged = true;
+		} else {
+			// Fallback: HTML Fullscreen API on the document root, so modals and
+			// popups stay visible. Exit is observed via fullscreenchange.
+			this.prevWasFullscreen = false;
+			this.wrapperMode = "domfs";
+			this.wrapperEngaged = true;
+			document.documentElement.requestFullscreen?.().catch(() => {
+				// Transient-activation rejection: continue windowed.
+				this.wrapperEngaged = false;
+				this.wrapperMode = null;
+			});
+		}
+	}
+
+	// Called from exitZen/teardown and from the mid-session setting toggle.
+	// Detaches the listener BEFORE restoring window state so the plugin's own
+	// setFullScreen(false) can never be mistaken for an external exit.
+	private releaseWrapper() {
+		const win = this.electronWindow();
+		this.detachLeaveFullScreenListener(win);
+		if (!this.wrapperEngaged) return;
+		if (this.wrapperMode === "electron") {
+			if (shouldExitOsFullscreen(true, this.prevWasFullscreen) && win?.setFullScreen) {
+				this.suppressFullscreenEventsUntil = Date.now() + 2000;
+				win.setFullScreen(false);
+			}
+		} else if (this.wrapperMode === "domfs" && document.fullscreenElement) {
+			document.exitFullscreen?.().catch(() => { /* already out */ });
+		}
+		this.wrapperEngaged = false;
+		this.wrapperMode = null;
+		this.prevWasFullscreen = false;
+	}
+
+	private attachLeaveFullScreenListener(win: ElectronWindowLike) {
+		if (this.leaveFullScreenListener || !win.on) return;
+		this.leaveFullScreenListener = () => this.onExternalFullscreenExit();
+		win.on("leave-full-screen", this.leaveFullScreenListener);
+	}
+
+	private detachLeaveFullScreenListener(win: ElectronWindowLike | null) {
+		if (this.leaveFullScreenListener && win?.removeListener) {
+			win.removeListener("leave-full-screen", this.leaveFullScreenListener);
+		}
+		this.leaveFullScreenListener = null;
+	}
+
+	// Esc-in-fullscreen, F11, the macOS green button, OS gestures: any external
+	// exit from OS fullscreen ends the session completely (R3, AE5).
+	private onExternalFullscreenExit() {
+		if (Date.now() < this.suppressFullscreenEventsUntil) {
+			this.suppressFullscreenEventsUntil = 0;
 			return;
 		}
+		if (this.sessionActive && this.wrapperEngaged) this.exitZen();
+	}
 
-		if (!document.fullscreenElement){
-			containerEl.requestFullscreen();
-			this.addStyles(leaf)
+	private onDomFullscreenChange() {
+		if (this.wrapperMode !== "domfs") return;
+		if (!document.fullscreenElement && this.sessionActive && this.wrapperEngaged) {
+			this.exitZen();
+		}
+	}
+
+	// Mid-session "Fullscreen window" toggle: window-chrome change only —
+	// the session (and its styling) stays.
+	onFullscreenWindowSettingChange(enabled: boolean) {
+		if (!this.sessionActive || !Platform.isDesktopApp) return;
+		if (enabled) {
+			this.engageWrapper();
 		} else {
-			document.exitFullscreen();
-			this.removeStyles(leaf)
-		}
-		containerEl.onfullscreenchange = () => {
-			if (!document.fullscreenElement){
-				this.removeStyles(leaf)
-			}
+			this.releaseWrapper();
 		}
 	}
 
-	enterZen(leaf: WorkspaceLeaf) {
-		this.zenLeaf = leaf;
-		const containerEl = (leaf as any).containerEl as HTMLElement;
-		containerEl.classList.add("prozen-fullscreen");
-		document.body.classList.add("prozen-zen");
-		if (!this.settings.showMobileToolbar) { document.body.classList.add("prozen-hide-toolbar") }
-		this.addStyles(leaf);
-	}
+	// ---------- Esc handling (R3) ----------
 
-	exitZen() {
-		if (!this.zenLeaf) return;
-		const leaf = this.zenLeaf;
-		this.zenLeaf = null;
-		const containerEl = (leaf as any).containerEl as HTMLElement;
-		containerEl.classList.remove("prozen-fullscreen");
-		document.body.classList.remove("prozen-zen", "prozen-hide-toolbar");
-		this.removeStyles(leaf);
-	}
-
-	addStyles(leaf: WorkspaceLeaf) {
-		const view = leaf.view as any;
-		const viewEl: HTMLElement = view.contentEl
-		const header: HTMLElement = view.headerEl
-		const isGraph = leaf.view.getViewType() === "graph"
-
-		if (!this.settings.showScroll){	viewEl.classList.add("noscroll") }
-		if (isGraph && !this.settings.showGraphControls) { view.dataEngine.controlsEl.classList.add("hide") }
-		isGraph ? viewEl.classList.add("vignette-radial") : viewEl.classList.add("vignette-linear")
-		// editMode is only present on markdown views in editing mode (e.g.
-		// not in reading mode on mobile), hence the optional chaining.
-		if (!isGraph && this.settings.forceReadable) { view.editMode?.editorEl?.classList.add("is-readable-line-width") }
-
-
-		viewEl.classList.add("animate")
-		this.settings.showHeader ? header.classList.add("animate") : header.classList.add("hide")
-
-	}
-
-	removeStyles(leaf: WorkspaceLeaf) {
-		const view = leaf.view as any;
-		const viewEl: HTMLElement = view.contentEl
-		const header: HTMLElement = view.headerEl
-		const isGraph = leaf.view.getViewType() === "graph"
-
-		if (isGraph) {
-			view.dataEngine.controlsEl.classList.remove("animate", "hide")
-		} else if (!(this.app.vault as any).getConfig('readableLineLength')) {
-			view.editMode?.editorEl?.classList.remove("is-readable-line-width")
+	private onKeydown(evt: KeyboardEvent) {
+		if (evt.key !== "Escape") return;
+		const vault = this.app.vault as unknown as VaultWithConfig;
+		const exit = shouldExitOnEsc({
+			sessionActive: this.sessionActive,
+			wrapperEngaged: this.wrapperEngaged,
+			modalOpen: !!document.querySelector(".modal"),
+			suggestionOpen: !!document.querySelector(".suggestion-container"),
+			vimMode: vault.getConfig?.("vimMode") === true,
+		});
+		if (exit) {
+			evt.preventDefault();
+			this.exitZen();
 		}
-
-		viewEl.classList.remove("vignette-linear", "vignette-radial", "animate", "noscroll")
-		header.classList.remove("animate", "hide")
 	}
 }
 
@@ -173,6 +414,7 @@ class ProzenSettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					vignetteOpacityNumber.innerText = " " + value.toString();
 					this.plugin.settings.vignetteOpacity = value;
+					this.plugin.refreshZenAppearance();
 					await this.plugin.saveSettings();
 				}))
 				.settingEl.createDiv("", (el: HTMLDivElement) => {
@@ -193,6 +435,7 @@ class ProzenSettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					vignetteScaleLinearNumber.innerText = " " + value.toString();
 					this.plugin.settings.vignetteScaleLinear = value;
+					this.plugin.refreshZenAppearance();
 					await this.plugin.saveSettings();
 				}))
 				.settingEl.createDiv("", (el: HTMLDivElement) => {
@@ -212,6 +455,7 @@ class ProzenSettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					vignetteScaleRadialNumber.innerText = " " + value.toString();
 					this.plugin.settings.vignetteScaleRadial = value;
+					this.plugin.refreshZenAppearance();
 					await this.plugin.saveSettings();
 				}))
 				.settingEl.createDiv("", (el: HTMLDivElement) => {
@@ -233,6 +477,7 @@ class ProzenSettingTab extends PluginSettingTab {
 				.setValue(String(this.plugin.settings.animationDuration))
 				.onChange(async (value) => {
 					this.plugin.settings.animationDuration = Number(value)
+					this.plugin.refreshZenAppearance();
 					await this.plugin.saveSettings();
 				}));
 
@@ -248,6 +493,7 @@ class ProzenSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.showHeader)
 				.onChange(async (value) => {
 					this.plugin.settings.showHeader = value;
+					this.plugin.refreshZenAppearance();
 					await this.plugin.saveSettings();
 			})
 		);
@@ -259,6 +505,7 @@ class ProzenSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.showScroll)
 				.onChange(async (value) => {
 					this.plugin.settings.showScroll = value;
+					this.plugin.refreshZenAppearance();
 					await this.plugin.saveSettings();
 			})
 		);
@@ -270,6 +517,7 @@ class ProzenSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.showGraphControls)
 				.onChange(async (value) => {
 					this.plugin.settings.showGraphControls = value;
+					this.plugin.refreshZenAppearance();
 					await this.plugin.saveSettings();
 			})
 		);
@@ -282,8 +530,7 @@ class ProzenSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.showMobileToolbar)
 					.onChange(async (value) => {
 						this.plugin.settings.showMobileToolbar = value;
-						document.body.classList.toggle("prozen-hide-toolbar",
-							document.body.classList.contains("prozen-zen") && !value);
+						this.plugin.refreshZenAppearance();
 						await this.plugin.saveSettings();
 				})
 			);
@@ -293,6 +540,21 @@ class ProzenSettingTab extends PluginSettingTab {
 			text: "Misc",
 		})
 
+// FULLSCREEN WINDOW SETTING (desktop only)
+		if (Platform.isDesktopApp) {
+			new Setting(containerEl)
+				.setName("Fullscreen window")
+				.setDesc("Also put the app window into OS fullscreen when entering Zen mode. Turn off for windowed Zen — distraction-free inside the window, other apps still visible.")
+				.addToggle((toggle) => toggle
+					.setValue(this.plugin.settings.fullscreenWindow)
+					.onChange(async (value) => {
+						this.plugin.settings.fullscreenWindow = value;
+						this.plugin.onFullscreenWindowSettingChange(value);
+						await this.plugin.saveSettings();
+				})
+			);
+		}
+
 // FORCE READABLE SETTING
 		new Setting(containerEl)
 			.setName("Force content centering")
@@ -301,6 +563,7 @@ class ProzenSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.forceReadable)
 				.onChange(async (value) => {
 					this.plugin.settings.forceReadable = value;
+					this.plugin.refreshZenAppearance();
 					await this.plugin.saveSettings();
 			})
 		);
