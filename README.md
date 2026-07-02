@@ -6,7 +6,17 @@ The true 'Zen' (fullscreen) mode for Obsidian.
 
 ProZen not just simply turns your active tab fullscreen - it removes every single distraction. All panels, icons, even scrollbar is gone in Zen mode. And for those who like **extra** concentration on writing or reading, ProZen can dim the sides of the screen, like a vignette.
 
-This fork also works on Obsidian **mobile** (iOS and Android). Since the mobile webview has no Fullscreen API, Zen mode there expands the active tab over the whole app window and hides the navigation bar instead. To exit, run the Zen mode command again (pull down to open the command palette).
+This fork also works on Obsidian **mobile** (iOS and Android): Zen mode expands the active tab over the whole app window and hides the navigation bar. To exit, run the Zen mode command again (pull down to open the command palette).
+
+Since Zen Core v2, the same engine powers every platform, and the session is resilient:
+
+- **Zen follows you.** Switching tabs, following links, or using the quick switcher keeps you in Zen on the new note — no more broken styling after `Ctrl-Tab`.
+- **Zen survives restarts.** If the app relaunches (or iOS/Android evicts Obsidian in the background), Zen restores automatically on the active note. The restore never force-fullscreens your window.
+- **Windowed Zen.** On desktop, the new **Fullscreen window** setting (on by default) controls whether entering Zen also puts the app into OS fullscreen. Turn it off for distraction-free writing inside a normal window.
+- **Command palette in Zen.** Modals and the command palette now work inside Zen on desktop too.
+- **Esc exits windowed Zen** on desktop. Exceptions: an open modal or autocomplete consumes the first Esc, and when **vim mode** is enabled Esc never exits Zen (vim users press Esc constantly — use the command or hotkey instead).
+
+**Requires Obsidian 1.8.7 or newer.**
 
 ![prozen](https://user-images.githubusercontent.com/69085343/203395343-b1b35200-662d-48f3-b400-3a99fccce915.gif)
 *The gradient is much smoother than on the gif*.
@@ -33,11 +43,8 @@ Various toggles for showing/hiding view's elements in Zen mode:
 - Header
 - Graph controls in graph view
 #### Other settings (Misc)
-- **Force content centering**: There's a toggle in the _Editor_ section Obsidian's settings called _Readable line width_. When it's toggled off, text content takes all the page's width available. _Force content centering_ makes the text centered in Zen mode ignoring this global setting. 
-
-
-## Known Issues
-- When cycling through panes with `Ctrl-Tab` or switching to graph view with `Ctrl-G`, Zen mode styling turns off for all the tabs, but stays on the tab, for which Zen mode was initially triggered. In one of the future releases, I would like to make jumping to tabs possible while staying in Zen mode.    
+- **Fullscreen window** (desktop only): Also put the app window into OS fullscreen when entering Zen mode. Turn off for windowed Zen. On by default.
+- **Force content centering**: There's a toggle in the _Editor_ section Obsidian's settings called _Readable line width_. When it's toggled off, text content takes all the page's width available. _Force content centering_ makes the text centered in Zen mode ignoring this global setting.
 
 ## About me
 My name (last name) is Moskvitin, I am an amateur self-taught JS developer, taking coding as a hobby. I hope, someday, I will be skilled enough to turn this hobby into a full-time job. I realize that experienced developers may find my code sloppy and sub-optimal, but I take my pet projects seriously, hunt for perfection in tiny things and try my best to fix the issues I can fix being at this skill level.
