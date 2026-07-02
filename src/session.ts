@@ -83,3 +83,13 @@ export function shouldEngageWrapper(isDesktopApp: boolean, fullscreenWindowSetti
 export function shouldExitOsFullscreen(wrapperEngaged: boolean, prevWasFullscreen: boolean): boolean {
 	return wrapperEngaged && !prevWasFullscreen;
 }
+
+/*
+ * Plugin-initiated setFullScreen(false) calls open a short suppression
+ * window so the resulting leave-full-screen event is not mistaken for the
+ * user exiting OS fullscreen. Strict `<`: an event at exactly the deadline
+ * is treated as genuine.
+ */
+export function shouldSuppressFullscreenEvent(now: number, suppressUntil: number): boolean {
+	return now < suppressUntil;
+}

@@ -6,7 +6,8 @@ import {
 	shouldEngageWrapper,
 	shouldExitOnEsc,
 	shouldExitOsFullscreen,
-	LeafContext,
+	shouldSuppressFullscreenEvent,
+	type LeafContext,
 } from "./src/session";
 
 interface PluginSettings {
@@ -71,15 +72,21 @@ interface VaultWithConfig {
 export default class Prozen extends Plugin {
 	settings: PluginSettings;
 	private sessionActive = false;
-	// The wrapper put (or found) the window in OS fullscreen for this session.
-	private wrapperEngaged = false;
 	private prevWasFullscreen = false;
 	private wrapperMode: "electron" | "domfs" | null = null;
-	// Plugin-initiated setFullScreen calls suppress the external-exit listener
-	// until this timestamp (Electron emits fullscreen events asynchronously).
+	// Invalidates in-flight async fullscreen work (the domfs requestFullscreen
+	// promise) when the wrapper is released or re-engaged before it settles.
+	private wrapperGeneration = 0;
+	// Plugin-initiated setFullScreen(false) calls suppress the external-exit
+	// listener until this timestamp (Electron emits the events asynchronously).
 	private suppressFullscreenEventsUntil = 0;
 	private enteringTimer: number | null = null;
 	private leaveFullScreenListener: (() => void) | null = null;
+
+	// The wrapper put (or found) the window in OS fullscreen for this session.
+	private get wrapperEngaged(): boolean {
+		return this.wrapperMode !== null;
+	}
 
 	async onload() {
 		await this.loadSettings();
@@ -114,10 +121,6 @@ export default class Prozen extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
-	}
-
-	isZenActive(): boolean {
-		return this.sessionActive;
 	}
 
 	toggleZen() {
@@ -189,13 +192,23 @@ export default class Prozen extends Plugin {
 	}
 
 	private updateMarker(leaf: WorkspaceLeaf | null) {
+		const previous = document.querySelector("." + MARKER_CLASS);
 		// Clearing every occurrence first makes duplicate markers structurally
 		// impossible, even across leaf drags and layout rebuilds.
 		this.clearAllMarkers();
 		if (!leaf) return;
+		// Re-checking the decision here is defense-in-depth for the enterZen
+		// call path, which invokes updateMarker without a prior decideMarker.
 		if (decideMarker(this.sessionActive, this.leafContext(leaf)) !== "move") return;
 		const containerEl = (leaf as unknown as LeafWithContainer).containerEl;
-		containerEl?.classList.add(MARKER_CLASS);
+		if (!containerEl) return;
+		containerEl.classList.add(MARKER_CLASS);
+		// Migrating to a different leaf inside the entry-animation window would
+		// restart the CSS animation on the newly matched element — end the
+		// window instead so the fade plays once per session entry.
+		if (previous && previous !== containerEl) {
+			this.clearEnteringTimer();
+		}
 	}
 
 	private clearAllMarkers() {
@@ -287,22 +300,35 @@ export default class Prozen extends Plugin {
 			this.prevWasFullscreen = win.isFullScreen();
 			this.attachLeaveFullScreenListener(win);
 			if (!this.prevWasFullscreen) {
-				this.suppressFullscreenEventsUntil = Date.now() + 2000;
+				// No suppression here: setFullScreen(true) emits enter-full-screen,
+				// never leave-full-screen, so any leave event after entering is a
+				// genuine external exit and must end the session.
 				win.setFullScreen(true);
 			}
 			this.wrapperMode = "electron";
-			this.wrapperEngaged = true;
 		} else {
 			// Fallback: HTML Fullscreen API on the document root, so modals and
-			// popups stay visible. Exit is observed via fullscreenchange.
+			// popups stay visible. Exit is observed via fullscreenchange. The
+			// generation token invalidates this async work if the session exits
+			// (or re-engages) before the promise settles.
 			this.prevWasFullscreen = false;
 			this.wrapperMode = "domfs";
-			this.wrapperEngaged = true;
-			document.documentElement.requestFullscreen?.().catch(() => {
-				// Transient-activation rejection: continue windowed.
-				this.wrapperEngaged = false;
-				this.wrapperMode = null;
-			});
+			const generation = ++this.wrapperGeneration;
+			document.documentElement.requestFullscreen?.()
+				.then(() => {
+					if (generation !== this.wrapperGeneration) {
+						// The session released the wrapper while the request was in
+						// flight — leave fullscreen again instead of stranding the
+						// window fullscreen with Zen already off.
+						document.exitFullscreen?.().catch(() => { /* already out */ });
+					}
+				})
+				.catch(() => {
+					// Transient-activation rejection: continue windowed.
+					if (generation === this.wrapperGeneration) {
+						this.wrapperMode = null;
+					}
+				});
 		}
 	}
 
@@ -310,10 +336,13 @@ export default class Prozen extends Plugin {
 	// Detaches the listener BEFORE restoring window state so the plugin's own
 	// setFullScreen(false) can never be mistaken for an external exit.
 	private releaseWrapper() {
+		this.wrapperGeneration++;
 		const win = this.electronWindow();
 		this.detachLeaveFullScreenListener(win);
 		if (!this.wrapperEngaged) return;
 		if (this.wrapperMode === "electron") {
+			// First arg is true by construction: the wrapperEngaged guard above
+			// already established the wrapper owns the window's fullscreen state.
 			if (shouldExitOsFullscreen(true, this.prevWasFullscreen) && win?.setFullScreen) {
 				this.suppressFullscreenEventsUntil = Date.now() + 2000;
 				win.setFullScreen(false);
@@ -321,7 +350,6 @@ export default class Prozen extends Plugin {
 		} else if (this.wrapperMode === "domfs" && document.fullscreenElement) {
 			document.exitFullscreen?.().catch(() => { /* already out */ });
 		}
-		this.wrapperEngaged = false;
 		this.wrapperMode = null;
 		this.prevWasFullscreen = false;
 	}
@@ -341,8 +369,12 @@ export default class Prozen extends Plugin {
 
 	// Esc-in-fullscreen, F11, the macOS green button, OS gestures: any external
 	// exit from OS fullscreen ends the session completely (R3, AE5).
+	// The suppression window can only be open here after a rapid settings
+	// OFF→ON re-engage (release detaches this listener before its own
+	// setFullScreen(false), so the plugin's own exits never reach it) — and
+	// in that one case swallowing the stale leave event is correct.
 	private onExternalFullscreenExit() {
-		if (Date.now() < this.suppressFullscreenEventsUntil) {
+		if (shouldSuppressFullscreenEvent(Date.now(), this.suppressFullscreenEventsUntil)) {
 			this.suppressFullscreenEventsUntil = 0;
 			return;
 		}
@@ -371,6 +403,10 @@ export default class Prozen extends Plugin {
 
 	private onKeydown(evt: KeyboardEvent) {
 		if (evt.key !== "Escape") return;
+		// An Esc that Obsidian's keymap or CodeMirror already consumed (closing
+		// a modal or suggestion synchronously) arrives here defaultPrevented —
+		// honoring it preserves two-press semantics regardless of DOM timing.
+		if (evt.defaultPrevented) return;
 		const vault = this.app.vault as unknown as VaultWithConfig;
 		const exit = shouldExitOnEsc({
 			sessionActive: this.sessionActive,

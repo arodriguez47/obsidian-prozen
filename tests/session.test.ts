@@ -6,6 +6,7 @@ import {
 	shouldEngageWrapper,
 	shouldExitOnEsc,
 	shouldExitOsFullscreen,
+	shouldSuppressFullscreenEvent,
 	type LeafContext,
 } from "../src/session";
 
@@ -42,6 +43,10 @@ describe("decideToggle", () => {
 	});
 
 	// T3/T4: toggle-off is unconditional — the exit trap the old code had.
+	it("exits while active on a plain note", () => {
+		expect(decideToggle(true, note())).toBe("exit");
+	});
+
 	it("exits while active even when the active view is empty", () => {
 		expect(decideToggle(true, note({ viewKind: "empty" }))).toBe("exit");
 	});
@@ -145,6 +150,25 @@ describe("wrapper decisions", () => {
 		expect(shouldEngageWrapper(true, true)).toBe(true);
 		expect(shouldEngageWrapper(true, false)).toBe(false);
 		expect(shouldEngageWrapper(false, true)).toBe(false);
+		expect(shouldEngageWrapper(false, false)).toBe(false);
+	});
+
+	// T14/T15: plugin-initiated setFullScreen(false) opens a suppression
+	// window; anything at or past the deadline is a genuine external exit.
+	it("suppresses fullscreen events before the deadline", () => {
+		expect(shouldSuppressFullscreenEvent(999, 1000)).toBe(true);
+	});
+
+	it("treats events after the deadline as genuine", () => {
+		expect(shouldSuppressFullscreenEvent(1001, 1000)).toBe(false);
+	});
+
+	it("treats an event at exactly the deadline as genuine (strict <)", () => {
+		expect(shouldSuppressFullscreenEvent(1000, 1000)).toBe(false);
+	});
+
+	it("never suppresses when no window is open", () => {
+		expect(shouldSuppressFullscreenEvent(12345, 0)).toBe(false);
 	});
 
 	// AC-9 / T17: restore the window's pre-Zen fullscreen state.
